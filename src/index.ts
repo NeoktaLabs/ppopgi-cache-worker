@@ -37,6 +37,11 @@ export default {
         if (!env.SUBGRAPH_URL) {
           return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
         }
+
+        // IMPORTANT: edge-cache only, never browser-cache
+        const ttl = 3;
+        const cc = cacheControlEdgeOnly(ttl);
+
         try {
           const upstream = await fetch(env.SUBGRAPH_URL, {
             method: "POST",
@@ -55,7 +60,8 @@ export default {
             status: upstream.status,
             headers: {
               "content-type": ct,
-              "Cache-Control": "public, max-age=3",
+              "Cache-Control": cc,
+              "CDN-Cache-Control": cc,
               "X-Cache": "BYPASS",
             },
           });
@@ -93,28 +99,28 @@ export default {
       }
 
       const query = typeof body?.query === "string" ? body.query : "";
-      const variables =
-        body?.variables && typeof body.variables === "object" ? body.variables : {};
+      const variables = body?.variables && typeof body.variables === "object" ? body.variables : {};
 
       if (!query) return withCors(new Response("Missing query", { status: 400 }), origin);
-      if (query.length > 60_000)
-        return withCors(new Response("Query too large", { status: 413 }), origin);
+      if (query.length > 60_000) return withCors(new Response("Query too large", { status: 413 }), origin);
 
       // Clamp to protect indexer
       clampPagination(variables);
 
       const ttl = pickTtlSeconds(query);
+      const cc = cacheControlEdgeOnly(ttl);
 
       // Cache key from query+variables (canonical)
       const cacheKey = await sha256Hex(
         canonicalStringify({
-          v: 3, // bump version to avoid collisions with old cache keys
+          v: 4, // bump version to avoid collisions with old cache keys
           query,
           variables,
         })
       );
 
       // Cache API uses Request as key; we make a synthetic GET
+      // IMPORTANT: ignore incoming querystring entirely to allow frontend ?cb=... without busting edge cache
       const cacheUrl = new URL(req.url);
       cacheUrl.pathname = `/__cache/${cacheKey}`;
       cacheUrl.search = "";
@@ -126,9 +132,10 @@ export default {
       try {
         const cached = await cache.match(cacheReq);
         if (cached) {
-          // Safe: return cached.clone() so body can be read downstream if needed
+          // Return cached.clone() so body can be read downstream if needed
           const hit = addHeaders(cached, {
-            "Cache-Control": `public, max-age=${ttl}`,
+            "Cache-Control": cc,
+            "CDN-Cache-Control": cc,
             "X-Cache": "HIT",
           });
           return withCors(hit, origin);
@@ -166,9 +173,7 @@ export default {
           // Cache only ok responses
           if (v.ok) {
             const toCache = makeTextResponse(v, ttl, false);
-            ctx.waitUntil(
-              cache.put(cacheReq, toCache.clone()).catch((e) => console.error("cache.put failed", e))
-            );
+            ctx.waitUntil(cache.put(cacheReq, toCache.clone()).catch((e) => console.error("cache.put failed", e)));
           }
 
           return v;
@@ -207,14 +212,29 @@ export default {
   },
 };
 
+// -------------------- Cache-Control helpers --------------------
+
+/**
+ * Edge-cache only:
+ * - Browser: max-age=0 (always revalidate; avoids device "stickiness")
+ * - Edge/shared: s-maxage=ttl (Cloudflare cache stays hot)
+ * - SWR: allow instant responses while edge refreshes
+ */
+function cacheControlEdgeOnly(ttl: number) {
+  return `public, max-age=0, s-maxage=${ttl}, stale-while-revalidate=${ttl}`;
+}
+
 // -------------------- Response builders (NO stream reuse) --------------------
 
 function makeTextResponse(v: InflightValue, ttl: number, hit: boolean): Response {
+  const cc = cacheControlEdgeOnly(ttl);
+
   return new Response(v.text, {
     status: v.status,
     headers: {
       "content-type": v.contentType,
-      "Cache-Control": `public, max-age=${ttl}`,
+      "Cache-Control": cc,
+      "CDN-Cache-Control": cc,
       "X-Cache": hit ? "HIT" : "MISS",
     },
   });
