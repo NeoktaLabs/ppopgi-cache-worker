@@ -1,4 +1,5 @@
 // src/index.ts
+
 export interface Env {
   SUBGRAPH_URL: string;
 }
@@ -18,6 +19,52 @@ export default {
 
       const url = new URL(req.url);
 
+      // ✅ Simple health check (no upstream)
+      if (url.pathname === "/health") {
+        return withCors(new Response("ok", { status: 200 }), origin);
+      }
+
+      // ✅ Dedicated meta endpoint (no cache hashing, very reliable)
+      if (url.pathname === "/meta") {
+        try {
+          if (!env.SUBGRAPH_URL) {
+            return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
+          }
+
+          const upstream = await fetch(env.SUBGRAPH_URL, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              query: "query __Meta { _meta { block { number } } }",
+              variables: {},
+              operationName: "__Meta",
+            }),
+          });
+
+          const text = await upstream.text();
+          return withCors(
+            new Response(text, {
+              status: upstream.status,
+              headers: {
+                "content-type": upstream.headers.get("content-type") ?? "application/json",
+                "Cache-Control": "public, max-age=3",
+                "X-Cache": "BYPASS",
+              },
+            }),
+            origin
+          );
+        } catch (e) {
+          return withCors(
+            new Response(JSON.stringify({ error: "UPSTREAM_FETCH_FAILED", message: String(e) }), {
+              status: 502,
+              headers: { "content-type": "application/json" },
+            }),
+            origin
+          );
+        }
+      }
+
+      // Only proxy GraphQL here
       if (url.pathname !== "/graphql") {
         return withCors(new Response("Not found", { status: 404 }), origin);
       }
@@ -56,7 +103,7 @@ export default {
       // Stable cache key: sha256(canonical({query, variables}))
       const cacheKey = await sha256Hex(
         canonicalStringify({
-          v: 1,
+          v: 2, // bump to avoid collisions with older logic
           query,
           variables,
         })
@@ -70,8 +117,14 @@ export default {
 
       const cache = caches.default;
 
-      // Serve from cache if available
-      const cached = await cache.match(cacheReq);
+      // Serve from cache (guarded)
+      let cached: Response | undefined;
+      try {
+        cached = await cache.match(cacheReq);
+      } catch (e) {
+        console.error("cache.match failed", e);
+      }
+
       if (cached) {
         const out = withCacheHeaders(cached, ttl, true);
         return withCors(out, origin);
@@ -102,16 +155,19 @@ export default {
             },
           });
 
-          // Cache only successful responses
+          // Cache only successful responses (guarded)
           if (upstream.ok) {
             const toCache = withCacheHeaders(res.clone(), ttl, false);
-            ctx.waitUntil(cache.put(cacheReq, toCache));
+            ctx.waitUntil(
+              cache.put(cacheReq, toCache).catch((e) => {
+                console.error("cache.put failed", e);
+              })
+            );
           }
 
           res = withCacheHeaders(res, ttl, false);
           return res;
         } catch (err) {
-          // IMPORTANT: fetch() can throw on network/DNS/TLS issues
           const payload = JSON.stringify({
             error: "UPSTREAM_FETCH_FAILED",
             message: err instanceof Error ? err.message : String(err),
@@ -134,7 +190,6 @@ export default {
       const res = await p;
       return withCors(res, origin);
     } catch (err) {
-      // Catch ANY unexpected throws so the response still has CORS
       const payload = JSON.stringify({
         error: "WORKER_INTERNAL_ERROR",
         message: err instanceof Error ? err.message : String(err),
@@ -155,11 +210,11 @@ export default {
 function withCors(res: Response, origin?: string | null) {
   const headers = new Headers(res.headers);
 
-  // Dev: allow localhost. Prod: you can restrict later.
+  // Dev: allow localhost. Prod: restrict later if you want.
   headers.set("Access-Control-Allow-Origin", origin || "*");
   headers.set("Vary", "Origin");
 
-  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   headers.set("Access-Control-Allow-Headers", "Content-Type");
 
   return new Response(res.body, { status: res.status, headers });
@@ -172,7 +227,7 @@ function handleOptions(req: Request) {
   const headers = new Headers();
   headers.set("Access-Control-Allow-Origin", origin || "*");
   headers.set("Vary", "Origin");
-  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   headers.set("Access-Control-Allow-Headers", reqHeaders);
   headers.set("Access-Control-Max-Age", "86400");
 
@@ -216,6 +271,7 @@ function clampInt(n: number, min: number, max: number) {
 
 function pickTtlSeconds(query: string): number {
   const q = query.toLowerCase();
+  // Make GlobalFeed / raffleEvents more reactive
   if (q.includes("globalfeed") || q.includes("raffleevents")) return 3;
   return DEFAULT_TTL_SECONDS;
 }
