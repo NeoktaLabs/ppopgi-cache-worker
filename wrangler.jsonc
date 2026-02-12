@@ -1,6 +1,9 @@
-name = "ppopgi-cache-worker"
-main = "src/index.ts"
-compatibility_date = "2025-01-01"
+{
+  "name": "ppopgi-subgraph-cache",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
 
-[vars]
-SUBGRAPH_URL = "https://gateway.thegraph.com/api/24c1de4d71a1e5990e8a3e91987c8741/subgraphs/id/BWeTkqhD2jWvCeTGEKoM54KCTq5ZXAA2Hs7tQv1gLt6S"
+  "vars": {
+    "SUBGRAPH_URL": "https://api.thegraph.com/subgraphs/name/<YOUR>/<SUBGRAPH>"
+  }
+}
