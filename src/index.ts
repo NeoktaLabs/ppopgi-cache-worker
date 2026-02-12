@@ -12,109 +12,141 @@ export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = req.headers.get("Origin");
 
-    // CORS preflight
-    if (req.method === "OPTIONS") return handleOptions(req);
-
-    const url = new URL(req.url);
-
-    if (url.pathname !== "/graphql") {
-      return withCors(new Response("Not found", { status: 404 }), origin);
-    }
-
-    if (req.method !== "POST") {
-      return withCors(new Response("Method not allowed", { status: 405 }), origin);
-    }
-
-    // Read body once
-    const raw = await req.text();
-    let body: any;
     try {
-      body = raw ? JSON.parse(raw) : {};
-    } catch {
-      return withCors(new Response("Bad JSON", { status: 400 }), origin);
-    }
+      // CORS preflight
+      if (req.method === "OPTIONS") return handleOptions(req);
 
-    const query = typeof body?.query === "string" ? body.query : "";
-    const variables = body?.variables && typeof body.variables === "object" ? body.variables : {};
+      const url = new URL(req.url);
 
-    if (!env.SUBGRAPH_URL) {
-      return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
-    }
-    if (!query) return withCors(new Response("Missing query", { status: 400 }), origin);
-    if (query.length > 60_000) return withCors(new Response("Query too large", { status: 413 }), origin);
-
-    // Clamp pagination and ids to protect the subgraph
-    clampPagination(variables);
-
-    // TTL policy: tweak based on query content
-    const ttl = pickTtlSeconds(query);
-
-    // Stable cache key: sha256(canonical({query, variables}))
-    const cacheKey = await sha256Hex(
-      canonicalStringify({
-        v: 1,
-        query,
-        variables,
-      })
-    );
-
-    // Synthetic GET for Cache API
-    const cacheUrl = new URL(req.url);
-    cacheUrl.pathname = `/__cache/${cacheKey}`;
-    cacheUrl.search = "";
-    const cacheReq = new Request(cacheUrl.toString(), { method: "GET" });
-
-    const cache = caches.default;
-
-    // Serve from cache if available
-    const cached = await cache.match(cacheReq);
-    if (cached) {
-      // Ensure CORS + cache headers are present
-      const out = withCacheHeaders(cached, ttl, true);
-      return withCors(out, origin);
-    }
-
-    // In-flight dedupe
-    const existing = inflight.get(cacheKey);
-    if (existing) {
-      const res = await existing;
-      return withCors(res.clone(), origin);
-    }
-
-    const p = (async () => {
-      // Forward to The Graph
-      const upstream = await fetch(env.SUBGRAPH_URL, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query, variables }),
-      });
-
-      const text = await upstream.text();
-
-      // Build response (pass through status)
-      let res = new Response(text, {
-        status: upstream.status,
-        headers: {
-          "content-type": upstream.headers.get("content-type") ?? "application/json",
-        },
-      });
-
-      // Cache only successful responses
-      if (upstream.ok) {
-        const toCache = withCacheHeaders(res.clone(), ttl, false);
-        ctx.waitUntil(cache.put(cacheReq, toCache));
+      if (url.pathname !== "/graphql") {
+        return withCors(new Response("Not found", { status: 404 }), origin);
       }
 
-      res = withCacheHeaders(res, ttl, false);
-      return res;
-    })().finally(() => {
-      inflight.delete(cacheKey);
-    });
+      if (req.method !== "POST") {
+        return withCors(new Response("Method not allowed", { status: 405 }), origin);
+      }
 
-    inflight.set(cacheKey, p);
+      if (!env.SUBGRAPH_URL) {
+        return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
+      }
 
-    const res = await p;
-    return withCors(res, origin);
+      // Read body once
+      const raw = await req.text();
+      let body: any;
+      try {
+        body = raw ? JSON.parse(raw) : {};
+      } catch {
+        return withCors(new Response("Bad JSON", { status: 400 }), origin);
+      }
+
+      const query = typeof body?.query === "string" ? body.query : "";
+      const variables =
+        body?.variables && typeof body.variables === "object" ? body.variables : {};
+
+      if (!query) return withCors(new Response("Missing query", { status: 400 }), origin);
+      if (query.length > 60_000)
+        return withCors(new Response("Query too large", { status: 413 }), origin);
+
+      // Clamp pagination and ids to protect the subgraph
+      clampPagination(variables);
+
+      // TTL policy: tweak based on query content
+      const ttl = pickTtlSeconds(query);
+
+      // Stable cache key: sha256(canonical({query, variables}))
+      const cacheKey = await sha256Hex(
+        canonicalStringify({
+          v: 1,
+          query,
+          variables,
+        })
+      );
+
+      // Synthetic GET for Cache API
+      const cacheUrl = new URL(req.url);
+      cacheUrl.pathname = `/__cache/${cacheKey}`;
+      cacheUrl.search = "";
+      const cacheReq = new Request(cacheUrl.toString(), { method: "GET" });
+
+      const cache = caches.default;
+
+      // Serve from cache if available
+      const cached = await cache.match(cacheReq);
+      if (cached) {
+        const out = withCacheHeaders(cached, ttl, true);
+        return withCors(out, origin);
+      }
+
+      // In-flight dedupe
+      const existing = inflight.get(cacheKey);
+      if (existing) {
+        const res = await existing;
+        return withCors(res.clone(), origin);
+      }
+
+      const p = (async () => {
+        try {
+          const upstream = await fetch(env.SUBGRAPH_URL, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ query, variables }),
+          });
+
+          const text = await upstream.text();
+
+          // Build response (pass through status)
+          let res = new Response(text, {
+            status: upstream.status,
+            headers: {
+              "content-type": upstream.headers.get("content-type") ?? "application/json",
+            },
+          });
+
+          // Cache only successful responses
+          if (upstream.ok) {
+            const toCache = withCacheHeaders(res.clone(), ttl, false);
+            ctx.waitUntil(cache.put(cacheReq, toCache));
+          }
+
+          res = withCacheHeaders(res, ttl, false);
+          return res;
+        } catch (err) {
+          // IMPORTANT: fetch() can throw on network/DNS/TLS issues
+          const payload = JSON.stringify({
+            error: "UPSTREAM_FETCH_FAILED",
+            message: err instanceof Error ? err.message : String(err),
+          });
+          return withCacheHeaders(
+            new Response(payload, {
+              status: 502,
+              headers: { "content-type": "application/json" },
+            }),
+            0,
+            false
+          );
+        }
+      })().finally(() => {
+        inflight.delete(cacheKey);
+      });
+
+      inflight.set(cacheKey, p);
+
+      const res = await p;
+      return withCors(res, origin);
+    } catch (err) {
+      // Catch ANY unexpected throws so the response still has CORS
+      const payload = JSON.stringify({
+        error: "WORKER_INTERNAL_ERROR",
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return withCors(
+        new Response(payload, {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+        origin
+      );
+    }
   },
 };
 
@@ -123,7 +155,7 @@ export default {
 function withCors(res: Response, origin?: string | null) {
   const headers = new Headers(res.headers);
 
-  // For dev: allow all. For prod, you can restrict to your domains.
+  // Dev: allow localhost. Prod: you can restrict later.
   headers.set("Access-Control-Allow-Origin", origin || "*");
   headers.set("Vary", "Origin");
 
@@ -168,7 +200,6 @@ function clampPagination(variables: any) {
       if (k === "first" && typeof v === "number") obj[k] = clampInt(v, 1, 50);
       if (k === "skip" && typeof v === "number") obj[k] = clampInt(v, 0, 100_000);
 
-      // Clamp common array vars (ids)
       if ((k === "ids" || k.endsWith("Ids")) && Array.isArray(v)) obj[k] = v.slice(0, 200);
 
       walk(v);
@@ -185,10 +216,7 @@ function clampInt(n: number, min: number, max: number) {
 
 function pickTtlSeconds(query: string): number {
   const q = query.toLowerCase();
-
-  // Make your GlobalFeed / raffleEvents a bit more reactive
   if (q.includes("globalfeed") || q.includes("raffleevents")) return 3;
-
   return DEFAULT_TTL_SECONDS;
 }
 
@@ -215,5 +243,7 @@ function canonicalStringify(value: any): string {
 async function sha256Hex(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
   const digest = await crypto.subtle.digest("SHA-256", data);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return [...new Uint8Array(digest)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
