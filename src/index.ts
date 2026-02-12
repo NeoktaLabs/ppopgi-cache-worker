@@ -1,23 +1,28 @@
+// src/index.ts
 export interface Env {
   SUBGRAPH_URL: string;
 }
 
 const DEFAULT_TTL_SECONDS = 5;
 
-// Very small in-flight dedupe map (per isolate). Helps during bursts.
+// Small in-flight dedupe map (per isolate) to reduce burst fan-out
 const inflight = new Map<string, Promise<Response>>();
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const origin = req.headers.get("Origin");
+
     // CORS preflight
-    if (req.method === "OPTIONS") return corsPreflight(req);
+    if (req.method === "OPTIONS") return handleOptions(req);
 
     const url = new URL(req.url);
+
     if (url.pathname !== "/graphql") {
-      return withCors(new Response("Not found", { status: 404 }));
+      return withCors(new Response("Not found", { status: 404 }), origin);
     }
+
     if (req.method !== "POST") {
-      return withCors(new Response("Method not allowed", { status: 405 }));
+      return withCors(new Response("Method not allowed", { status: 405 }), origin);
     }
 
     // Read body once
@@ -26,31 +31,34 @@ export default {
     try {
       body = raw ? JSON.parse(raw) : {};
     } catch {
-      return withCors(new Response("Bad JSON", { status: 400 }));
+      return withCors(new Response("Bad JSON", { status: 400 }), origin);
     }
 
     const query = typeof body?.query === "string" ? body.query : "";
     const variables = body?.variables && typeof body.variables === "object" ? body.variables : {};
 
-    if (!query) return withCors(new Response("Missing query", { status: 400 }));
-    if (query.length > 60_000) return withCors(new Response("Query too large", { status: 413 }));
+    if (!env.SUBGRAPH_URL) {
+      return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
+    }
+    if (!query) return withCors(new Response("Missing query", { status: 400 }), origin);
+    if (query.length > 60_000) return withCors(new Response("Query too large", { status: 413 }), origin);
 
-    // Clamp pagination to protect The Graph + your wallet
+    // Clamp pagination and ids to protect the subgraph
     clampPagination(variables);
 
-    // TTL policy: you can tune based on query content
-    const ttl = pickTtlSeconds(query, variables);
+    // TTL policy: tweak based on query content
+    const ttl = pickTtlSeconds(query);
 
-    // Build stable cache key hash
+    // Stable cache key: sha256(canonical({query, variables}))
     const cacheKey = await sha256Hex(
       canonicalStringify({
-        v: 1, // bump if you change logic and want to bust cache keys
+        v: 1,
         query,
         variables,
       })
     );
 
-    // Use a synthetic GET request to store in Cloudflare cache
+    // Synthetic GET for Cache API
     const cacheUrl = new URL(req.url);
     cacheUrl.pathname = `/__cache/${cacheKey}`;
     cacheUrl.search = "";
@@ -58,36 +66,33 @@ export default {
 
     const cache = caches.default;
 
-    // Serve cache
+    // Serve from cache if available
     const cached = await cache.match(cacheReq);
     if (cached) {
-      return withCors(withCacheHeaders(cached, ttl, true));
+      // Ensure CORS + cache headers are present
+      const out = withCacheHeaders(cached, ttl, true);
+      return withCors(out, origin);
     }
 
     // In-flight dedupe
     const existing = inflight.get(cacheKey);
     if (existing) {
       const res = await existing;
-      return withCors(res.clone());
+      return withCors(res.clone(), origin);
     }
 
     const p = (async () => {
+      // Forward to The Graph
       const upstream = await fetch(env.SUBGRAPH_URL, {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          // Optional: forward some tracing headers
-          ...(req.headers.get("cf-connecting-ip")
-            ? { "x-forwarded-for": req.headers.get("cf-connecting-ip")! }
-            : {}),
-        },
+        headers: { "content-type": "application/json" },
         body: JSON.stringify({ query, variables }),
       });
 
       const text = await upstream.text();
 
-      // Build response
-      const res = new Response(text, {
+      // Build response (pass through status)
+      let res = new Response(text, {
         status: upstream.status,
         headers: {
           "content-type": upstream.headers.get("content-type") ?? "application/json",
@@ -100,54 +105,76 @@ export default {
         ctx.waitUntil(cache.put(cacheReq, toCache));
       }
 
-      // Always return CORS-enabled response
-      return withCors(withCacheHeaders(res, ttl, false));
-    })()
-      .finally(() => {
-        inflight.delete(cacheKey);
-      });
+      res = withCacheHeaders(res, ttl, false);
+      return res;
+    })().finally(() => {
+      inflight.delete(cacheKey);
+    });
 
     inflight.set(cacheKey, p);
-    return await p;
+
+    const res = await p;
+    return withCors(res, origin);
   },
 };
 
-function corsPreflight(req: Request) {
+// -------------------- CORS --------------------
+
+function withCors(res: Response, origin?: string | null) {
+  const headers = new Headers(res.headers);
+
+  // For dev: allow all. For prod, you can restrict to your domains.
+  headers.set("Access-Control-Allow-Origin", origin || "*");
+  headers.set("Vary", "Origin");
+
+  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Content-Type");
+
+  return new Response(res.body, { status: res.status, headers });
+}
+
+function handleOptions(req: Request) {
+  const origin = req.headers.get("Origin");
+  const reqHeaders = req.headers.get("Access-Control-Request-Headers") || "Content-Type";
+
   const headers = new Headers();
-  headers.set("access-control-allow-origin", "*");
-  headers.set("access-control-allow-methods", "POST,OPTIONS");
-  headers.set("access-control-allow-headers", req.headers.get("access-control-request-headers") || "content-type");
-  headers.set("access-control-max-age", "86400");
+  headers.set("Access-Control-Allow-Origin", origin || "*");
+  headers.set("Vary", "Origin");
+  headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", reqHeaders);
+  headers.set("Access-Control-Max-Age", "86400");
+
   return new Response(null, { status: 204, headers });
 }
 
-function withCors(res: Response) {
-  const headers = new Headers(res.headers);
-  headers.set("access-control-allow-origin", "*");
-  headers.set("vary", "origin");
-  return new Response(res.body, { status: res.status, headers });
-}
+// -------------------- Cache headers --------------------
 
 function withCacheHeaders(res: Response, ttlSeconds: number, hit: boolean) {
   const headers = new Headers(res.headers);
-  headers.set("cache-control", `public, max-age=${ttlSeconds}`);
-  headers.set("x-cache", hit ? "HIT" : "MISS");
+  headers.set("Cache-Control", `public, max-age=${ttlSeconds}`);
+  headers.set("X-Cache", hit ? "HIT" : "MISS");
   return new Response(res.body, { status: res.status, headers });
 }
 
+// -------------------- Limits / TTL logic --------------------
+
 function clampPagination(variables: any) {
-  // Recursively clamp any "first" and "skip"
   const walk = (obj: any) => {
     if (!obj || typeof obj !== "object") return;
+
     for (const k of Object.keys(obj)) {
       const v = obj[k];
-      if (k === "first" && typeof v === "number") obj[k] = clampInt(v, 1, 50); // <-- important
+
+      if (k === "first" && typeof v === "number") obj[k] = clampInt(v, 1, 50);
       if (k === "skip" && typeof v === "number") obj[k] = clampInt(v, 0, 100_000);
-      // If you have id arrays, clamp their size
+
+      // Clamp common array vars (ids)
       if ((k === "ids" || k.endsWith("Ids")) && Array.isArray(v)) obj[k] = v.slice(0, 200);
+
       walk(v);
     }
   };
+
   walk(variables);
 }
 
@@ -156,20 +183,17 @@ function clampInt(n: number, min: number, max: number) {
   return Math.min(Math.max(Math.trunc(n), min), max);
 }
 
-function pickTtlSeconds(query: string, variables: any): number {
-  // Default 5s everywhere. Optionally tighten activity to 3s.
+function pickTtlSeconds(query: string): number {
   const q = query.toLowerCase();
 
-  // Your GlobalFeed query includes "raffleEvents" and "recentWinners/recentCancels"
+  // Make your GlobalFeed / raffleEvents a bit more reactive
   if (q.includes("globalfeed") || q.includes("raffleevents")) return 3;
-
-  // Participants leaderboard can be a bit heavier; 5s is fine, or bump to 8s.
-  if (q.includes("raffleparticipants")) return 5;
 
   return DEFAULT_TTL_SECONDS;
 }
 
-// Canonical stringify: stable ordering so cache key doesn’t fragment
+// -------------------- Stable hashing --------------------
+
 function canonicalStringify(value: any): string {
   const seen = new WeakSet();
 
@@ -181,9 +205,7 @@ function canonicalStringify(value: any): string {
     if (Array.isArray(v)) return v.map(helper);
 
     const out: Record<string, any> = {};
-    for (const k of Object.keys(v).sort()) {
-      out[k] = helper(v[k]);
-    }
+    for (const k of Object.keys(v).sort()) out[k] = helper(v[k]);
     return out;
   };
 
