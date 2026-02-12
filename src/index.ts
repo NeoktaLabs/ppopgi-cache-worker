@@ -1,36 +1,43 @@
 // src/index.ts
-
 export interface Env {
   SUBGRAPH_URL: string;
 }
 
 const DEFAULT_TTL_SECONDS = 5;
 
-// Small in-flight dedupe map (per isolate) to reduce burst fan-out
-const inflight = new Map<string, Promise<Response>>();
+/**
+ * Store in-flight results as plain data (NOT Response),
+ * so we never reuse a locked ReadableStream.
+ */
+type InflightValue = {
+  status: number;
+  contentType: string;
+  text: string;
+  ok: boolean;
+};
+
+const inflight = new Map<string, Promise<InflightValue>>();
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const origin = req.headers.get("Origin");
 
     try {
-      // CORS preflight
       if (req.method === "OPTIONS") return handleOptions(req);
 
       const url = new URL(req.url);
 
-      // ✅ Simple health check (no upstream)
+      // Health check
       if (url.pathname === "/health") {
         return withCors(new Response("ok", { status: 200 }), origin);
       }
 
-      // ✅ Dedicated meta endpoint (no cache hashing, very reliable)
+      // Dedicated meta endpoint (simple + reliable)
       if (url.pathname === "/meta") {
+        if (!env.SUBGRAPH_URL) {
+          return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
+        }
         try {
-          if (!env.SUBGRAPH_URL) {
-            return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
-          }
-
           const upstream = await fetch(env.SUBGRAPH_URL, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -42,17 +49,18 @@ export default {
           });
 
           const text = await upstream.text();
-          return withCors(
-            new Response(text, {
-              status: upstream.status,
-              headers: {
-                "content-type": upstream.headers.get("content-type") ?? "application/json",
-                "Cache-Control": "public, max-age=3",
-                "X-Cache": "BYPASS",
-              },
-            }),
-            origin
-          );
+          const ct = upstream.headers.get("content-type") ?? "application/json";
+
+          const res = new Response(text, {
+            status: upstream.status,
+            headers: {
+              "content-type": ct,
+              "Cache-Control": "public, max-age=3",
+              "X-Cache": "BYPASS",
+            },
+          });
+
+          return withCors(res, origin);
         } catch (e) {
           return withCors(
             new Response(JSON.stringify({ error: "UPSTREAM_FETCH_FAILED", message: String(e) }), {
@@ -64,20 +72,18 @@ export default {
         }
       }
 
-      // Only proxy GraphQL here
+      // GraphQL proxy
       if (url.pathname !== "/graphql") {
         return withCors(new Response("Not found", { status: 404 }), origin);
       }
-
       if (req.method !== "POST") {
         return withCors(new Response("Method not allowed", { status: 405 }), origin);
       }
-
       if (!env.SUBGRAPH_URL) {
         return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
       }
 
-      // Read body once
+      // Parse request body
       const raw = await req.text();
       let body: any;
       try {
@@ -94,22 +100,21 @@ export default {
       if (query.length > 60_000)
         return withCors(new Response("Query too large", { status: 413 }), origin);
 
-      // Clamp pagination and ids to protect the subgraph
+      // Clamp to protect indexer
       clampPagination(variables);
 
-      // TTL policy: tweak based on query content
       const ttl = pickTtlSeconds(query);
 
-      // Stable cache key: sha256(canonical({query, variables}))
+      // Cache key from query+variables (canonical)
       const cacheKey = await sha256Hex(
         canonicalStringify({
-          v: 2, // bump to avoid collisions with older logic
+          v: 3, // bump version to avoid collisions with old cache keys
           query,
           variables,
         })
       );
 
-      // Synthetic GET for Cache API
+      // Cache API uses Request as key; we make a synthetic GET
       const cacheUrl = new URL(req.url);
       cacheUrl.pathname = `/__cache/${cacheKey}`;
       cacheUrl.search = "";
@@ -117,27 +122,30 @@ export default {
 
       const cache = caches.default;
 
-      // Serve from cache (guarded)
-      let cached: Response | undefined;
+      // Cache match (guarded)
       try {
-        cached = await cache.match(cacheReq);
+        const cached = await cache.match(cacheReq);
+        if (cached) {
+          // Safe: return cached.clone() so body can be read downstream if needed
+          const hit = addHeaders(cached, {
+            "Cache-Control": `public, max-age=${ttl}`,
+            "X-Cache": "HIT",
+          });
+          return withCors(hit, origin);
+        }
       } catch (e) {
         console.error("cache.match failed", e);
       }
 
-      if (cached) {
-        const out = withCacheHeaders(cached, ttl, true);
-        return withCors(out, origin);
-      }
-
-      // In-flight dedupe
+      // In-flight dedupe (returns plain text data)
       const existing = inflight.get(cacheKey);
       if (existing) {
-        const res = await existing;
-        return withCors(res.clone(), origin);
+        const v = await existing;
+        const res = makeTextResponse(v, ttl, true);
+        return withCors(res, origin);
       }
 
-      const p = (async () => {
+      const p = (async (): Promise<InflightValue> => {
         try {
           const upstream = await fetch(env.SUBGRAPH_URL, {
             method: "POST",
@@ -146,40 +154,34 @@ export default {
           });
 
           const text = await upstream.text();
+          const ct = upstream.headers.get("content-type") ?? "application/json";
 
-          // Build response (pass through status)
-          let res = new Response(text, {
+          const v: InflightValue = {
             status: upstream.status,
-            headers: {
-              "content-type": upstream.headers.get("content-type") ?? "application/json",
-            },
-          });
+            contentType: ct,
+            text,
+            ok: upstream.ok,
+          };
 
-          // Cache only successful responses (guarded)
-          if (upstream.ok) {
-            const toCache = withCacheHeaders(res.clone(), ttl, false);
+          // Cache only ok responses
+          if (v.ok) {
+            const toCache = makeTextResponse(v, ttl, false);
             ctx.waitUntil(
-              cache.put(cacheReq, toCache).catch((e) => {
-                console.error("cache.put failed", e);
-              })
+              cache.put(cacheReq, toCache.clone()).catch((e) => console.error("cache.put failed", e))
             );
           }
 
-          res = withCacheHeaders(res, ttl, false);
-          return res;
-        } catch (err) {
-          const payload = JSON.stringify({
-            error: "UPSTREAM_FETCH_FAILED",
-            message: err instanceof Error ? err.message : String(err),
-          });
-          return withCacheHeaders(
-            new Response(payload, {
-              status: 502,
-              headers: { "content-type": "application/json" },
+          return v;
+        } catch (e) {
+          return {
+            status: 502,
+            contentType: "application/json",
+            text: JSON.stringify({
+              error: "UPSTREAM_FETCH_FAILED",
+              message: e instanceof Error ? e.message : String(e),
             }),
-            0,
-            false
-          );
+            ok: false,
+          };
         }
       })().finally(() => {
         inflight.delete(cacheKey);
@@ -187,37 +189,59 @@ export default {
 
       inflight.set(cacheKey, p);
 
-      const res = await p;
+      const v = await p;
+      const res = makeTextResponse(v, ttl, false);
       return withCors(res, origin);
-    } catch (err) {
-      const payload = JSON.stringify({
-        error: "WORKER_INTERNAL_ERROR",
-        message: err instanceof Error ? err.message : String(err),
-      });
+    } catch (e) {
       return withCors(
-        new Response(payload, {
-          status: 500,
-          headers: { "content-type": "application/json" },
-        }),
+        new Response(
+          JSON.stringify({
+            error: "WORKER_INTERNAL_ERROR",
+            message: e instanceof Error ? e.message : String(e),
+          }),
+          { status: 500, headers: { "content-type": "application/json" } }
+        ),
         origin
       );
     }
   },
 };
 
+// -------------------- Response builders (NO stream reuse) --------------------
+
+function makeTextResponse(v: InflightValue, ttl: number, hit: boolean): Response {
+  return new Response(v.text, {
+    status: v.status,
+    headers: {
+      "content-type": v.contentType,
+      "Cache-Control": `public, max-age=${ttl}`,
+      "X-Cache": hit ? "HIT" : "MISS",
+    },
+  });
+}
+
+/**
+ * Clone response & add headers (safe even if body was consumed elsewhere).
+ */
+function addHeaders(res: Response, extra: Record<string, string>): Response {
+  const r = res.clone();
+  const headers = new Headers(r.headers);
+  for (const [k, v] of Object.entries(extra)) headers.set(k, v);
+  return new Response(r.body, { status: r.status, headers });
+}
+
 // -------------------- CORS --------------------
 
 function withCors(res: Response, origin?: string | null) {
-  const headers = new Headers(res.headers);
+  const r = res.clone();
+  const headers = new Headers(r.headers);
 
-  // Dev: allow localhost. Prod: restrict later if you want.
   headers.set("Access-Control-Allow-Origin", origin || "*");
   headers.set("Vary", "Origin");
-
   headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   headers.set("Access-Control-Allow-Headers", "Content-Type");
 
-  return new Response(res.body, { status: res.status, headers });
+  return new Response(r.body, { status: r.status, headers });
 }
 
 function handleOptions(req: Request) {
@@ -234,15 +258,6 @@ function handleOptions(req: Request) {
   return new Response(null, { status: 204, headers });
 }
 
-// -------------------- Cache headers --------------------
-
-function withCacheHeaders(res: Response, ttlSeconds: number, hit: boolean) {
-  const headers = new Headers(res.headers);
-  headers.set("Cache-Control", `public, max-age=${ttlSeconds}`);
-  headers.set("X-Cache", hit ? "HIT" : "MISS");
-  return new Response(res.body, { status: res.status, headers });
-}
-
 // -------------------- Limits / TTL logic --------------------
 
 function clampPagination(variables: any) {
@@ -252,9 +267,11 @@ function clampPagination(variables: any) {
     for (const k of Object.keys(obj)) {
       const v = obj[k];
 
+      // Conservative defaults
       if (k === "first" && typeof v === "number") obj[k] = clampInt(v, 1, 50);
       if (k === "skip" && typeof v === "number") obj[k] = clampInt(v, 0, 100_000);
 
+      // Clamp common array vars (ids)
       if ((k === "ids" || k.endsWith("Ids")) && Array.isArray(v)) obj[k] = v.slice(0, 200);
 
       walk(v);
@@ -271,7 +288,6 @@ function clampInt(n: number, min: number, max: number) {
 
 function pickTtlSeconds(query: string): number {
   const q = query.toLowerCase();
-  // Make GlobalFeed / raffleEvents more reactive
   if (q.includes("globalfeed") || q.includes("raffleevents")) return 3;
   return DEFAULT_TTL_SECONDS;
 }
@@ -299,7 +315,5 @@ function canonicalStringify(value: any): string {
 async function sha256Hex(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
   const digest = await crypto.subtle.digest("SHA-256", data);
-  return [...new Uint8Array(digest)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
