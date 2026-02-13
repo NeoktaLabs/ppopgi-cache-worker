@@ -43,15 +43,19 @@ export default {
         const cc = cacheControlEdgeOnly(ttl);
 
         try {
-          const upstream = await fetch(env.SUBGRAPH_URL, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              query: "query __Meta { _meta { block { number } } }",
-              variables: {},
-              operationName: "__Meta",
-            }),
-          });
+          const upstream = await fetchWithTimeout(
+            env.SUBGRAPH_URL,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                query: "query __Meta { _meta { block { number } } }",
+                variables: {},
+                operationName: "__Meta",
+              }),
+            },
+            8000
+          );
 
           const text = await upstream.text();
           const ct = upstream.headers.get("content-type") ?? "application/json";
@@ -62,7 +66,8 @@ export default {
               "content-type": ct,
               "Cache-Control": cc,
               "CDN-Cache-Control": cc,
-              "X-Cache": "BYPASS",
+              // More truthful than "BYPASS": this endpoint is edge-cacheable
+              "X-Cache": "MISS",
             },
           });
 
@@ -70,7 +75,7 @@ export default {
         } catch (e) {
           return withCors(
             new Response(JSON.stringify({ error: "UPSTREAM_FETCH_FAILED", message: String(e) }), {
-              status: 502,
+              status: isAbortTimeout(e) ? 504 : 502,
               headers: { "content-type": "application/json" },
             }),
             origin
@@ -111,9 +116,9 @@ export default {
       const cc = cacheControlEdgeOnly(ttl);
 
       // Cache key from query+variables (canonical)
-      const cacheKey = await sha256Hex(
+      const hashKey = await sha256Hex(
         canonicalStringify({
-          v: 4, // bump version to avoid collisions with old cache keys
+          v: 5, // bump version to avoid collisions with old cache keys
           query,
           variables,
         })
@@ -122,7 +127,7 @@ export default {
       // Cache API uses Request as key; we make a synthetic GET
       // IMPORTANT: ignore incoming querystring entirely to allow frontend ?cb=... without busting edge cache
       const cacheUrl = new URL(req.url);
-      cacheUrl.pathname = `/__cache/${cacheKey}`;
+      cacheUrl.pathname = `/__cache/${hashKey}`;
       cacheUrl.search = "";
       const cacheReq = new Request(cacheUrl.toString(), { method: "GET" });
 
@@ -144,21 +149,25 @@ export default {
         console.error("cache.match failed", e);
       }
 
-      // In-flight dedupe (returns plain text data)
-      const existing = inflight.get(cacheKey);
+      // ✅ In-flight dedupe (fixed: use the SAME key for get/set/delete)
+      const existing = inflight.get(hashKey);
       if (existing) {
         const v = await existing;
-        const res = makeTextResponse(v, ttl, true);
+        const res = makeTextResponse(v, ttl, "COALESCED");
         return withCors(res, origin);
       }
 
       const p = (async (): Promise<InflightValue> => {
         try {
-          const upstream = await fetch(env.SUBGRAPH_URL, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ query, variables }),
-          });
+          const upstream = await fetchWithTimeout(
+            env.SUBGRAPH_URL,
+            {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ query, variables }),
+            },
+            10_000
+          );
 
           const text = await upstream.text();
           const ct = upstream.headers.get("content-type") ?? "application/json";
@@ -172,30 +181,30 @@ export default {
 
           // Cache only ok responses
           if (v.ok) {
-            const toCache = makeTextResponse(v, ttl, false);
+            const toCache = makeTextResponse(v, ttl, "MISS");
             ctx.waitUntil(cache.put(cacheReq, toCache.clone()).catch((e) => console.error("cache.put failed", e)));
           }
 
           return v;
         } catch (e) {
           return {
-            status: 502,
+            status: isAbortTimeout(e) ? 504 : 502,
             contentType: "application/json",
             text: JSON.stringify({
-              error: "UPSTREAM_FETCH_FAILED",
+              error: isAbortTimeout(e) ? "UPSTREAM_TIMEOUT" : "UPSTREAM_FETCH_FAILED",
               message: e instanceof Error ? e.message : String(e),
             }),
             ok: false,
           };
         }
       })().finally(() => {
-        inflight.delete(cacheKey);
+        inflight.delete(hashKey);
       });
 
-      inflight.set(cacheKey, p);
+      inflight.set(hashKey, p);
 
       const v = await p;
-      const res = makeTextResponse(v, ttl, false);
+      const res = makeTextResponse(v, ttl, "MISS");
       return withCors(res, origin);
     } catch (e) {
       return withCors(
@@ -226,7 +235,7 @@ function cacheControlEdgeOnly(ttl: number) {
 
 // -------------------- Response builders (NO stream reuse) --------------------
 
-function makeTextResponse(v: InflightValue, ttl: number, hit: boolean): Response {
+function makeTextResponse(v: InflightValue, ttl: number, xCache: "HIT" | "MISS" | "COALESCED"): Response {
   const cc = cacheControlEdgeOnly(ttl);
 
   return new Response(v.text, {
@@ -235,7 +244,7 @@ function makeTextResponse(v: InflightValue, ttl: number, hit: boolean): Response
       "content-type": v.contentType,
       "Cache-Control": cc,
       "CDN-Cache-Control": cc,
-      "X-Cache": hit ? "HIT" : "MISS",
+      "X-Cache": xCache,
     },
   });
 }
@@ -257,7 +266,12 @@ function withCors(res: Response, origin?: string | null) {
   const headers = new Headers(r.headers);
 
   headers.set("Access-Control-Allow-Origin", origin || "*");
-  headers.set("Vary", "Origin");
+
+  // ✅ preserve any existing Vary and append Origin
+  const vary = headers.get("Vary");
+  if (!vary) headers.set("Vary", "Origin");
+  else if (!vary.toLowerCase().includes("origin")) headers.set("Vary", `${vary}, Origin`);
+
   headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   headers.set("Access-Control-Allow-Headers", "Content-Type");
 
@@ -270,7 +284,10 @@ function handleOptions(req: Request) {
 
   const headers = new Headers();
   headers.set("Access-Control-Allow-Origin", origin || "*");
+
+  // ✅ preserve + append
   headers.set("Vary", "Origin");
+
   headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   headers.set("Access-Control-Allow-Headers", reqHeaders);
   headers.set("Access-Control-Max-Age", "86400");
@@ -308,7 +325,15 @@ function clampInt(n: number, min: number, max: number) {
 
 function pickTtlSeconds(query: string): number {
   const q = query.toLowerCase();
+
+  // "hot" / fast-moving queries
   if (q.includes("globalfeed") || q.includes("raffleevents")) return 3;
+  if (q.includes("_meta") || q.includes("__meta")) return 3;
+
+  // Slightly longer for "stable" reads (details by id, participants, etc.)
+  // (Tune to taste; this reduces indexer load a lot.)
+  if (q.includes("rafflebyid") || q.includes("raffle(") || q.includes("raffleparticipants")) return 10;
+
   return DEFAULT_TTL_SECONDS;
 }
 
@@ -336,4 +361,28 @@ async function sha256Hex(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
   const digest = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// -------------------- Upstream timeout --------------------
+
+function isAbortTimeout(e: unknown): boolean {
+  const msg = String((e as any)?.message ?? e ?? "").toLowerCase();
+  return msg.includes("timeout");
+}
+
+async function fetchWithTimeout(input: RequestInfo, init: RequestInit, ms: number): Promise<Response> {
+  const ac = new AbortController();
+  const t = setTimeout(() => {
+    try {
+      ac.abort(new Error("timeout"));
+    } catch {
+      // ignore
+    }
+  }, ms);
+
+  try {
+    return await fetch(input, { ...init, signal: ac.signal });
+  } finally {
+    clearTimeout(t);
+  }
 }
