@@ -305,7 +305,7 @@ function clampPagination(variables: any) {
       const v = obj[k];
 
       // Conservative defaults
-      if (k === "first" && typeof v === "number") obj[k] = clampInt(v, 1, 50);
+      if (k === "first" && typeof v === "number") obj[k] = clampInt(v, 1, 200);
       if (k === "skip" && typeof v === "number") obj[k] = clampInt(v, 0, 100_000);
 
       // Clamp common array vars (ids)
