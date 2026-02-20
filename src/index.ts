@@ -20,22 +20,20 @@ const inflight = new Map<string, Promise<InflightValue>>();
 
 export default {
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const origin = req.headers.get("Origin");
-
     try {
-      if (req.method === "OPTIONS") return handleOptions(req);
+      if (req.method === "OPTIONS") return handleOptions();
 
       const url = new URL(req.url);
 
       // Health check
       if (url.pathname === "/health") {
-        return withCors(new Response("ok", { status: 200 }), origin);
+        return withCors(new Response("ok", { status: 200 }));
       }
 
       // Dedicated meta endpoint (simple + reliable)
       if (url.pathname === "/meta") {
         if (!env.SUBGRAPH_URL) {
-          return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
+          return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }));
         }
 
         // IMPORTANT: edge-cache only, never browser-cache
@@ -71,27 +69,26 @@ export default {
             },
           });
 
-          return withCors(res, origin);
+          return withCors(res);
         } catch (e) {
           return withCors(
             new Response(JSON.stringify({ error: "UPSTREAM_FETCH_FAILED", message: String(e) }), {
               status: isAbortTimeout(e) ? 504 : 502,
               headers: { "content-type": "application/json" },
-            }),
-            origin
+            })
           );
         }
       }
 
       // GraphQL proxy
       if (url.pathname !== "/graphql") {
-        return withCors(new Response("Not found", { status: 404 }), origin);
+        return withCors(new Response("Not found", { status: 404 }));
       }
       if (req.method !== "POST") {
-        return withCors(new Response("Method not allowed", { status: 405 }), origin);
+        return withCors(new Response("Method not allowed", { status: 405 }));
       }
       if (!env.SUBGRAPH_URL) {
-        return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }), origin);
+        return withCors(new Response("Missing SUBGRAPH_URL", { status: 500 }));
       }
 
       // Parse request body
@@ -100,14 +97,14 @@ export default {
       try {
         body = raw ? JSON.parse(raw) : {};
       } catch {
-        return withCors(new Response("Bad JSON", { status: 400 }), origin);
+        return withCors(new Response("Bad JSON", { status: 400 }));
       }
 
       const query = typeof body?.query === "string" ? body.query : "";
       const variables = body?.variables && typeof body.variables === "object" ? body.variables : {};
 
-      if (!query) return withCors(new Response("Missing query", { status: 400 }), origin);
-      if (query.length > 60_000) return withCors(new Response("Query too large", { status: 413 }), origin);
+      if (!query) return withCors(new Response("Missing query", { status: 400 }));
+      if (query.length > 60_000) return withCors(new Response("Query too large", { status: 413 }));
 
       // Clamp to protect indexer
       clampPagination(variables);
@@ -118,7 +115,7 @@ export default {
       // Cache key from query+variables (canonical)
       const hashKey = await sha256Hex(
         canonicalStringify({
-          v: 5, // bump version to avoid collisions with old cache keys
+          v: 6, // bump version due to CORS/cache behavior change
           query,
           variables,
         })
@@ -143,7 +140,7 @@ export default {
             "CDN-Cache-Control": cc,
             "X-Cache": "HIT",
           });
-          return withCors(hit, origin);
+          return withCors(hit);
         }
       } catch (e) {
         console.error("cache.match failed", e);
@@ -154,7 +151,7 @@ export default {
       if (existing) {
         const v = await existing;
         const res = makeTextResponse(v, ttl, "COALESCED");
-        return withCors(res, origin);
+        return withCors(res);
       }
 
       const p = (async (): Promise<InflightValue> => {
@@ -179,8 +176,19 @@ export default {
             ok: upstream.ok,
           };
 
-          // Cache only ok responses
-          if (v.ok) {
+          // Cache only ok responses (and avoid caching GraphQL "errors" payloads)
+          let okToCache = v.ok;
+          if (okToCache && ct.includes("application/json")) {
+            try {
+              const parsed = JSON.parse(text);
+              if (parsed && typeof parsed === "object" && "errors" in parsed) okToCache = false;
+            } catch {
+              // if JSON parse fails, don't cache
+              okToCache = false;
+            }
+          }
+
+          if (okToCache) {
             const toCache = makeTextResponse(v, ttl, "MISS");
             ctx.waitUntil(cache.put(cacheReq, toCache.clone()).catch((e) => console.error("cache.put failed", e)));
           }
@@ -205,7 +213,7 @@ export default {
 
       const v = await p;
       const res = makeTextResponse(v, ttl, "MISS");
-      return withCors(res, origin);
+      return withCors(res);
     } catch (e) {
       return withCors(
         new Response(
@@ -214,8 +222,7 @@ export default {
             message: e instanceof Error ? e.message : String(e),
           }),
           { status: 500, headers: { "content-type": "application/json" } }
-        ),
-        origin
+        )
       );
     }
   },
@@ -261,37 +268,40 @@ function addHeaders(res: Response, extra: Record<string, string>): Response {
 
 // -------------------- CORS --------------------
 
-function withCors(res: Response, origin?: string | null) {
+/**
+ * ✅ Always wildcard CORS to avoid cached responses being tied to a single Origin.
+ * This worker does not use credentials/cookies, so '*' is correct and safest.
+ */
+function withCors(res: Response) {
   const r = res.clone();
   const headers = new Headers(r.headers);
 
-  headers.set("Access-Control-Allow-Origin", origin || "*");
-
-  // ✅ preserve any existing Vary and append Origin
-  const vary = headers.get("Vary");
-  if (!vary) headers.set("Vary", "Origin");
-  else if (!vary.toLowerCase().includes("origin")) headers.set("Vary", `${vary}, Origin`);
-
+  headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   headers.set("Access-Control-Allow-Headers", "Content-Type");
+
+  // If upstream set Vary, keep it, but never vary on Origin (wildcard)
+  const vary = headers.get("Vary");
+  if (vary && vary.toLowerCase().includes("origin")) {
+    // remove "Origin" token from Vary (best-effort)
+    const cleaned = vary
+      .split(",")
+      .map((s) => s.trim())
+      .filter((t) => t.toLowerCase() !== "origin")
+      .join(", ");
+    if (cleaned) headers.set("Vary", cleaned);
+    else headers.delete("Vary");
+  }
 
   return new Response(r.body, { status: r.status, headers });
 }
 
-function handleOptions(req: Request) {
-  const origin = req.headers.get("Origin");
-  const reqHeaders = req.headers.get("Access-Control-Request-Headers") || "Content-Type";
-
+function handleOptions() {
   const headers = new Headers();
-  headers.set("Access-Control-Allow-Origin", origin || "*");
-
-  // ✅ preserve + append
-  headers.set("Vary", "Origin");
-
+  headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
-  headers.set("Access-Control-Allow-Headers", reqHeaders);
+  headers.set("Access-Control-Allow-Headers", "Content-Type");
   headers.set("Access-Control-Max-Age", "86400");
-
   return new Response(null, { status: 204, headers });
 }
 
@@ -305,8 +315,8 @@ function clampPagination(variables: any) {
       const v = obj[k];
 
       // Conservative defaults
-      if (k === "first" && typeof v === "number") obj[k] = clampInt(v, 1, 200);
-      if (k === "skip" && typeof v === "number") obj[k] = clampInt(v, 0, 100_000);
+      if (k === "first") obj[k] = clampNumberish(v, 1, 200);
+      if (k === "skip") obj[k] = clampNumberish(v, 0, 100_000);
 
       // Clamp common array vars (ids)
       if ((k === "ids" || k.endsWith("Ids")) && Array.isArray(v)) obj[k] = v.slice(0, 200);
@@ -316,6 +326,15 @@ function clampPagination(variables: any) {
   };
 
   walk(variables);
+}
+
+function clampNumberish(v: any, min: number, max: number) {
+  if (typeof v === "number") return clampInt(v, min, max);
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return clampInt(n, min, max);
+  }
+  return min;
 }
 
 function clampInt(n: number, min: number, max: number) {
